@@ -383,4 +383,32 @@ public class GameController {
         updateMsg.setData(room);
         messagingTemplate.convertAndSend("/topic/room/" + roomId, updateMsg);
     }
+
+    // 플레이어 방 퇴장 처리: /app/room/{roomId}/leave
+    @MessageMapping("/room/{roomId}/leave")
+    public void leaveRoom(@DestinationVariable String roomId, @Payload GameMessage message) {
+        GameRoom room = roomManager.getRoom(roomId);
+        String playerName = message.getSender();
+
+        // 1. 플레이어 목록에서 제거
+        if (room.getPlayers().containsKey(playerName)) {
+            room.getPlayers().remove(playerName);
+
+            // 게임 진행 중에 나갔다면 남은 사람의 승리로 게임 종료 처리
+            if (!"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase())) {
+                room.setHoldemPhase("END");
+                room.setWinnerMessage("상대방(" + playerName + ")이 도망갔습니다! 기권승 🏆");
+            }
+        }
+        // 2. 관전자 목록에서 제거
+        else if (room.getSpectators().containsKey(playerName)) {
+            room.getSpectators().remove(playerName);
+        }
+
+        // 3. 변경된 방 상태를 남은 사람들에게 브로드캐스트
+        GameMessage response = new GameMessage();
+        response.setType("STATE_UPDATE");
+        response.setData(room);
+        messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+    }
 }

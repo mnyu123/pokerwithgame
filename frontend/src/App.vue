@@ -116,6 +116,21 @@ const joinRoom = () => {
   safePublish(`/app/room/${roomId}/join`, { type: 'JOIN', sender: playerName.value })
 }
 
+// 방 나가기 함수
+const leaveRoom = () => {
+  // 서버에 퇴장 메시지 전송
+  safePublish(`/app/room/${roomId}/leave`, { type: 'LEAVE', sender: playerName.value })
+  
+  // 내 화면 상태 초기화
+  isJoined.value = false
+  gamePhase.value = 'LOBBY'
+  roomState.value = null
+  isWinner.value = false
+  fiveCards.value = []
+  myHoleCards.value = []
+  playerName.value = '' // 원한다면 이름도 초기화
+}
+
 const toggleReady = () => {
   safePublish(`/app/room/${roomId}/ready`, { type: 'READY', sender: playerName.value })
 }
@@ -173,6 +188,13 @@ const restartGame = () => {
       </span>
     </div>
     <hr />
+
+    <!-- 🌟 방 나가기 버튼 (접속 후에만 표시) 🌟 -->
+    <div v-if="isJoined" style="text-align: right; margin-bottom: 10px;">
+      <button @click="leaveRoom" style="background-color: #757575; color: white; padding: 5px 15px; border: none; border-radius: 4px; cursor: pointer;">
+        🚪 방 나가기
+      </button>
+    </div>
 
     <div v-if="!isJoined">
       <h3>플레이어 이름 입력</h3>

@@ -186,45 +186,36 @@ public class GameController {
         String winnerName = message.getSender();
         String selectedCard = (String) message.getData();
 
-        // 1. 승자에게 카드 지급
-        Player winner = room.getPlayers().get(winnerName);
-        winner.getHoleCards().add(selectedCard);
+        Player picker = room.getPlayers().get(winnerName);
+        picker.getHoleCards().add(selectedCard);
 
-        // 2. 패자에게 남은 카드 1장 랜덤 지급
-        List<String> remainingCards = new ArrayList<>(room.getCurrentFiveCards());
-        remainingCards.remove(selectedCard);
-        Collections.shuffle(remainingCards);
-        String loserCard = remainingCards.get(0);
+        // 1장째 획득(가위바위보 직후)인 경우: 패자에게 남은 카드 중 1장 랜덤 지급
+        if (picker.getHoleCards().size() == 1) {
+            List<String> remainingCards = new ArrayList<>(room.getCurrentFiveCards());
+            remainingCards.remove(selectedCard);
+            Collections.shuffle(remainingCards);
+            String loserCard = remainingCards.get(0);
 
-        Player loser = room.getPlayers().values().stream()
-                .filter(p -> !p.getPlayerName().equals(winnerName))
-                .findFirst().orElse(null);
+            Player loser = room.getPlayers().values().stream()
+                    .filter(p -> !p.getPlayerName().equals(winnerName))
+                    .findFirst().orElse(null);
 
-        if (loser != null) {
-            loser.getHoleCards().add(loserCard);
-        }
+            if (loser != null) {
+                loser.getHoleCards().add(loserCard);
+            }
+            room.getCurrentFiveCards().clear();
+            room.getRpsChoices().clear();
 
-        // 3. 필드 초기화
-        room.getCurrentFiveCards().clear();
-        room.getRpsChoices().clear();
-        room.getDiceGuesses().clear(); // 주사위 기록도 초기화
-
-        // 4. 보유 카드가 2장인지 확인하여 분기 처리
-        boolean isHoldemPhase = room.getPlayers().values().stream().allMatch(p -> p.getHoleCards().size() == 2);
-
-        GameMessage nextPhaseMsg = new GameMessage();
-        if (isHoldemPhase) {
-            // 방의 첫 번째 플레이어에게 턴을 넘김
-            String firstPlayer = new ArrayList<>(room.getPlayers().keySet()).get(0);
-            room.setCurrentTurn(firstPlayer);
-            room.setHoldemPhase("PRE_FLOP");
-
-            nextPhaseMsg.setType("HOLDEM_START");
-        } else {
+            // 2차 미니게임(주사위) 시작
+            GameMessage nextPhaseMsg = new GameMessage();
             nextPhaseMsg.setType("MINIGAME_2_START");
+            nextPhaseMsg.setData(room);
+            messagingTemplate.convertAndSend("/topic/room/" + roomId, nextPhaseMsg);
         }
-        nextPhaseMsg.setData(room);
-        messagingTemplate.convertAndSend("/topic/room/" + roomId, nextPhaseMsg);
+        // 2장째 획득(주사위 직후)인 경우: 바로 홀덤 시작 판정
+        else {
+            checkHoldemPhaseAndSend(room, roomId);
+        }
     }
 
     // 2. selectCard 메서드 아래에 새로운 베팅 처리 엔드포인트를 추가하세요.
@@ -356,46 +347,74 @@ public class GameController {
 
     private void evaluateDiceAndSendResult(String roomId, GameRoom room) {
         List<String> playerNames = new ArrayList<>(room.getDiceGuesses().keySet());
-        String p1 = playerNames.get(0);
-        String p2 = playerNames.get(1);
-        String g1 = room.getDiceGuesses().get(p1);
-        String g2 = room.getDiceGuesses().get(p2);
+        String p1Name = playerNames.get(0);
+        String p2Name = playerNames.get(1);
+        String g1 = room.getDiceGuesses().get(p1Name);
+        String g2 = room.getDiceGuesses().get(p2Name);
 
-        // 주사위 굴리기 (1~6 랜덤)
+        // 주사위 굴리기
         int diceNumber = new Random().nextInt(6) + 1;
         String actualResult = (diceNumber % 2 == 0) ? "EVEN" : "ODD";
 
         boolean p1Correct = g1.equals(actualResult);
         boolean p2Correct = g2.equals(actualResult);
 
-        // 둘 다 맞추거나 둘 다 틀린 경우 -> 무승부 (다시 굴림)
-        if (p1Correct == p2Correct) {
-            room.getDiceGuesses().clear();
-            GameMessage drawMsg = new GameMessage();
-            drawMsg.setType("MINIGAME_2_DRAW");
-            drawMsg.setData("주사위 결과: " + diceNumber + ". 무승부입니다! 다시 예측해주세요.");
-            messagingTemplate.convertAndSend("/topic/room/" + roomId, drawMsg);
-            return;
-        }
-
-        // 승자와 패자 결정
-        String winner = p1Correct ? p1 : p2;
-        String loser = p1Correct ? p2 : p1;
-
-        // 새로운 5장 뽑기
-        List<String> fiveCards = room.drawCards(5);
-        room.setCurrentFiveCards(fiveCards);
+        Player p1 = room.getPlayers().get(p1Name);
+        Player p2 = room.getPlayers().get(p2Name);
 
         Map<String, Object> resultData = new HashMap<>();
-        resultData.put("winner", winner);
-        resultData.put("loser", loser);
-        resultData.put("cards", fiveCards);
         resultData.put("diceNumber", diceNumber);
 
+        // P1 개별 처리
+        Map<String, Object> p1Result = new HashMap<>();
+        p1Result.put("isCorrect", p1Correct);
+        if (p1Correct) {
+            p1Result.put("cards", room.drawCards(5)); // 맞추면 5장 제공
+        } else {
+            p1.getHoleCards().add(room.drawCards(1).get(0)); // 틀리면 바로 1장 강제 지급
+            p1Result.put("cards", new ArrayList<>());
+        }
+
+        // P2 개별 처리
+        Map<String, Object> p2Result = new HashMap<>();
+        p2Result.put("isCorrect", p2Correct);
+        if (p2Correct) {
+            p2Result.put("cards", room.drawCards(5));
+        } else {
+            p2.getHoleCards().add(room.drawCards(1).get(0));
+        }
+
+        resultData.put(p1Name, p1Result);
+        resultData.put(p2Name, p2Result);
+        resultData.put("roomState", room);
+
+        room.getDiceGuesses().clear();
+
+        // 프론트엔드로 각각의 결과 발송
         GameMessage resultMsg = new GameMessage();
         resultMsg.setType("MINIGAME_2_RESULT");
         resultMsg.setData(resultData);
         messagingTemplate.convertAndSend("/topic/room/" + roomId, resultMsg);
+
+        // 만약 둘 다 틀려서 이미 카드가 2장씩 다 찼다면, 즉시 홀덤 시작!
+        if (!p1Correct && !p2Correct) {
+            checkHoldemPhaseAndSend(room, roomId);
+        }
+    }
+
+    private void checkHoldemPhaseAndSend(GameRoom room, String roomId) {
+        boolean isHoldemPhase = room.getPlayers().values().stream().allMatch(p -> p.getHoleCards().size() == 2);
+
+        if (isHoldemPhase) {
+            String firstPlayer = new ArrayList<>(room.getPlayers().keySet()).get(0);
+            room.setCurrentTurn(firstPlayer);
+            room.setHoldemPhase("PRE_FLOP");
+
+            GameMessage nextPhaseMsg = new GameMessage();
+            nextPhaseMsg.setType("HOLDEM_START");
+            nextPhaseMsg.setData(room);
+            messagingTemplate.convertAndSend("/topic/room/" + roomId, nextPhaseMsg);
+        }
     }
 
     // 게임 리셋(다음 라운드 준비): /app/room/{roomId}/restart

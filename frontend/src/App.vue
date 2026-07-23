@@ -109,21 +109,27 @@ const joinRoom = () => {
     } else if (payload.type === 'MINIGAME_2_DRAW') {
       if (!isSpectator.value) alert(payload.data) 
     } else if (payload.type === 'MINIGAME_2_RESULT') {
-      const resultData = payload.data
-      const isEven = resultData.diceNumber % 2 === 0 ? '짝수' : '홀수'
-      
-      if (!isSpectator.value) {
-        if (resultData.winner === playerName.value) {
-          isWinner.value = true
-          fiveCards.value = resultData.cards
-          alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n정답입니다! 두 번째 카드를 선택하세요.`)
-        } else {
-          isWinner.value = false
-          fiveCards.value = []
-          alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n틀렸습니다! 상대가 카드를 고르고 있습니다.`)
-        }
-      }
-      gamePhase.value = 'CARD_SELECT'
+          // 주사위 게임 개별 승패 결과 처리
+          const resultData = payload.data
+          roomState.value = resultData.roomState // 틀린 사람의 카드가 반영된 방 상태 갱신
+          
+          if (!isSpectator.value) {
+            myHoleCards.value = roomState.value.players[playerName.value].holeCards
+            
+            const isEven = resultData.diceNumber % 2 === 0 ? '짝수' : '홀수'
+            const myResult = resultData[playerName.value]
+            
+            if (myResult.isCorrect) {
+              isWinner.value = true
+              fiveCards.value = myResult.cards
+              alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n정답입니다! 두 번째 카드를 선택하세요.`)
+            } else {
+              isWinner.value = false
+              fiveCards.value = []
+              alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n틀렸습니다! 서버에서 랜덤으로 카드가 지급되었습니다.`)
+            }
+          }
+          gamePhase.value = 'CARD_SELECT'
     } else if (payload.type === 'HOLDEM_START') {
       roomState.value = payload.data
       if (!isSpectator.value) {
@@ -245,9 +251,9 @@ const restartGame = () => safePublish(`/app/room/${roomId.value}/restart`, { typ
     </div>
 
     <div v-if="gamePhase === 'CARD_SELECT'">
-      <h2 v-if="!isSpectator && isWinner">승리! 카드를 한 장 선택하세요.</h2>
-      <h2 v-else-if="!isSpectator">패배! 상대가 카드를 고르고 있습니다... 대기해주세요.</h2>
-      <h2 v-else>가위바위보 승자가 카드를 고르고 있습니다...</h2>
+      <h2 v-if="!isSpectator && isWinner">카드를 한 장 선택하세요.</h2>
+      <h2 v-else-if="!isSpectator">상대가 카드를 고르고 있습니다... 대기해주세요.</h2>
+      <h2 v-else>플레이어들이 카드를 고르고 있습니다...</h2>
       
       <div v-if="!isSpectator && isWinner" style="display: flex; gap: 10px;">
         <div v-for="card in fiveCards" :key="card" 

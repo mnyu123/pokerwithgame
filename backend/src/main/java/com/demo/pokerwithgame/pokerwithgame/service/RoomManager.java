@@ -22,6 +22,7 @@ public class RoomManager {
     }
 
     public GameRoom getRoom(String roomId) {
-        return rooms.get(roomId);
+        // 방이 없으면 자동으로 새로 생성해서 반환 (다중 방 지원의 핵심!)
+        return rooms.computeIfAbsent(roomId, GameRoom::new);
     }
 }

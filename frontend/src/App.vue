@@ -1,104 +1,56 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, onBeforeUnmount } from 'vue'
 import { Client } from '@stomp/stompjs'
 
 const connectionStatus = ref('연결 중...')
 const stompClient = ref(null)
 
 const playerName = ref('')
+const roomId = ref('') // 동적으로 입력받을 방 이름
+let currentSubscription = null // 현재 구독 중인 방 정보
+
 const isJoined = ref(false)
 const roomState = ref(null)
-// LOBBY -> MINIGAME_1 -> CARD_SELECT -> MINIGAME_2 -> HOLDEM_MAIN
 const gamePhase = ref('LOBBY') 
-
-const roomId = 'demo-room'
 
 const isWinner = ref(false)
 const fiveCards = ref([])
 const myHoleCards = ref([])
 
-// 내가 관전자인지 확인하는 computed 변수
 const isSpectator = computed(() => {
   if (!roomState.value || !roomState.value.spectators) return false;
   return roomState.value.spectators[playerName.value] !== undefined;
 })
 
+// 컴포넌트 마운트 시 최초 연결만 수행
 onMounted(() => {
   stompClient.value = new Client({
-    brokerURL: 'wss://holdem-demo-backend.fly.dev/ws', // 로컬 테스트 시에는 'ws://localhost:8080/ws'로 변경
+    // 로컬 테스트 시 'ws://localhost:8080/ws', 배포 시 'wss://백엔드주소.fly.dev/ws'
+    brokerURL: 'wss://holdem-demo-backend.fly.dev/ws', 
     onConnect: () => {
       connectionStatus.value = '서버와 웹소켓 연결 성공!'
-      
-      stompClient.value.subscribe(`/topic/room/${roomId}`, (message) => {
-        const payload = JSON.parse(message.body)
-        
-        if (payload.type === 'STATE_UPDATE') {
-          roomState.value = payload.data
-          
-          if (roomState.value.holdemPhase === 'LOBBY') {
-              gamePhase.value = 'LOBBY'
-              myHoleCards.value = []
-              isWinner.value = false
-              fiveCards.value = []
-          }
-        } else if (payload.type === 'MINIGAME_1_START') {
-          if (!isSpectator.value) alert('1차 미니게임: 가위바위보 시작!')
-          gamePhase.value = 'MINIGAME_1'
-        } else if (payload.type === 'MINIGAME_1_DRAW') {
-          if (!isSpectator.value) alert('가위바위보 무승부! 다시 선택해주세요.')
-        } else if (payload.type === 'MINIGAME_1_RESULT') {
-          const resultData = payload.data
-          if (resultData.winner === playerName.value) {
-            isWinner.value = true
-            fiveCards.value = resultData.cards
-          } else {
-            isWinner.value = false
-            fiveCards.value = []
-          }
-          gamePhase.value = 'CARD_SELECT'
-        } else if (payload.type === 'MINIGAME_2_START') {
-          roomState.value = payload.data
-          if (!isSpectator.value) {
-            myHoleCards.value = roomState.value.players[playerName.value].holeCards
-            alert('첫 번째 카드 획득!\n이제 2차 미니게임(주사위 홀/짝)을 시작합니다!')
-          }
-          gamePhase.value = 'MINIGAME_2'
-        } else if (payload.type === 'MINIGAME_2_DRAW') {
-          if (!isSpectator.value) alert(payload.data) 
-        } else if (payload.type === 'MINIGAME_2_RESULT') {
-          const resultData = payload.data
-          const isEven = resultData.diceNumber % 2 === 0 ? '짝수' : '홀수'
-          
-          if (!isSpectator.value) {
-            if (resultData.winner === playerName.value) {
-              isWinner.value = true
-              fiveCards.value = resultData.cards
-              alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n정답입니다! 두 번째 카드를 선택하세요.`)
-            } else {
-              isWinner.value = false
-              fiveCards.value = []
-              alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n틀렸습니다! 상대가 카드를 고르고 있습니다.`)
-            }
-          }
-          gamePhase.value = 'CARD_SELECT'
-        } else if (payload.type === 'HOLDEM_START') {
-          roomState.value = payload.data
-          if (!isSpectator.value) {
-            myHoleCards.value = roomState.value.players[playerName.value].holeCards
-            alert('두 번째 카드 획득 완료!\n본격적인 텍사스 홀덤을 시작합니다!')
-          }
-          gamePhase.value = 'HOLDEM_MAIN'
-        }
-      })
     },
     onStompError: (frame) => {
       console.error('에러 발생: ' + frame.headers['message'])
+      connectionStatus.value = '연결 실패'
     }
   })
   stompClient.value.activate()
+
+  // 브라우저 탭을 닫거나 새로고침할 때 안전하게 퇴장 신호를 보내는 방어 로직
+  window.addEventListener('beforeunload', handleBeforeUnload)
 })
 
-// 통신 에러 방어 로직이 적용된 공통 전송 함수
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+})
+
+const handleBeforeUnload = () => {
+  if (isJoined.value) {
+    leaveRoom()
+  }
+}
+
 const safePublish = (destination, payload) => {
   if (!stompClient.value || !stompClient.value.connected) {
     alert('서버와 연결이 끊어졌습니다. 새로고침 해주세요.');
@@ -110,53 +62,107 @@ const safePublish = (destination, payload) => {
   });
 }
 
+// 🌟 다중 방 입장을 위한 동적 구독 로직 🌟
 const joinRoom = () => {
-  if (!playerName.value.trim()) return alert('이름을 입력해주세요!')
+  if (!playerName.value.trim() || !roomId.value.trim()) return alert('방 이름과 이름을 모두 입력해주세요!')
+  
+  // 기존에 다른 방을 구독 중이었다면 해제
+  if (currentSubscription) {
+    currentSubscription.unsubscribe()
+  }
+
+  // 새로 입력한 방 번호로 웹소켓 이벤트 구독
+  currentSubscription = stompClient.value.subscribe(`/topic/room/${roomId.value}`, (message) => {
+    const payload = JSON.parse(message.body)
+    
+    if (payload.type === 'STATE_UPDATE') {
+      roomState.value = payload.data
+      
+      if (roomState.value.holdemPhase === 'LOBBY') {
+          gamePhase.value = 'LOBBY'
+          myHoleCards.value = []
+          isWinner.value = false
+          fiveCards.value = []
+      }
+    } else if (payload.type === 'MINIGAME_1_START') {
+      if (!isSpectator.value) alert('1차 미니게임: 가위바위보 시작!')
+      gamePhase.value = 'MINIGAME_1'
+    } else if (payload.type === 'MINIGAME_1_DRAW') {
+      if (!isSpectator.value) alert('가위바위보 무승부! 다시 선택해주세요.')
+    } else if (payload.type === 'MINIGAME_1_RESULT') {
+      const resultData = payload.data
+      if (resultData.winner === playerName.value) {
+        isWinner.value = true
+        fiveCards.value = resultData.cards
+      } else {
+        isWinner.value = false
+        fiveCards.value = []
+      }
+      gamePhase.value = 'CARD_SELECT'
+    } else if (payload.type === 'MINIGAME_2_START') {
+      roomState.value = payload.data
+      if (!isSpectator.value) {
+        myHoleCards.value = roomState.value.players[playerName.value].holeCards
+        alert('첫 번째 카드 획득!\n이제 2차 미니게임(주사위 홀/짝)을 시작합니다!')
+      }
+      gamePhase.value = 'MINIGAME_2'
+    } else if (payload.type === 'MINIGAME_2_DRAW') {
+      if (!isSpectator.value) alert(payload.data) 
+    } else if (payload.type === 'MINIGAME_2_RESULT') {
+      const resultData = payload.data
+      const isEven = resultData.diceNumber % 2 === 0 ? '짝수' : '홀수'
+      
+      if (!isSpectator.value) {
+        if (resultData.winner === playerName.value) {
+          isWinner.value = true
+          fiveCards.value = resultData.cards
+          alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n정답입니다! 두 번째 카드를 선택하세요.`)
+        } else {
+          isWinner.value = false
+          fiveCards.value = []
+          alert(`주사위 눈: ${resultData.diceNumber} (${isEven})\n틀렸습니다! 상대가 카드를 고르고 있습니다.`)
+        }
+      }
+      gamePhase.value = 'CARD_SELECT'
+    } else if (payload.type === 'HOLDEM_START') {
+      roomState.value = payload.data
+      if (!isSpectator.value) {
+        myHoleCards.value = roomState.value.players[playerName.value].holeCards
+        alert('두 번째 카드 획득 완료!\n본격적인 텍사스 홀덤을 시작합니다!')
+      }
+      gamePhase.value = 'HOLDEM_MAIN'
+    }
+  })
+
   isJoined.value = true
-  safePublish(`/app/room/${roomId}/join`, { type: 'JOIN', sender: playerName.value })
+  safePublish(`/app/room/${roomId.value}/join`, { type: 'JOIN', sender: playerName.value })
 }
 
-// 방 나가기 함수
 const leaveRoom = () => {
-  // 서버에 퇴장 메시지 전송
-  safePublish(`/app/room/${roomId}/leave`, { type: 'LEAVE', sender: playerName.value })
+  safePublish(`/app/room/${roomId.value}/leave`, { type: 'LEAVE', sender: playerName.value })
   
-  // 내 화면 상태 초기화
+  if (currentSubscription) {
+    currentSubscription.unsubscribe()
+    currentSubscription = null
+  }
+  
   isJoined.value = false
   gamePhase.value = 'LOBBY'
   roomState.value = null
   isWinner.value = false
   fiveCards.value = []
   myHoleCards.value = []
-  playerName.value = '' // 원한다면 이름도 초기화
 }
 
-const toggleReady = () => {
-  safePublish(`/app/room/${roomId}/ready`, { type: 'READY', sender: playerName.value })
-}
-
-const selectRps = (choice) => {
-  safePublish(`/app/room/${roomId}/rps`, { type: 'RPS_CHOICE', sender: playerName.value, data: choice })
-}
-
-const selectCard = (card) => {
-  safePublish(`/app/room/${roomId}/selectCard`, { type: 'CARD_SELECT', sender: playerName.value, data: card })
-}
-
-const guessDice = (guess) => {
-  safePublish(`/app/room/${roomId}/dice`, { type: 'DICE_GUESS', sender: playerName.value, data: guess })
-}
+// === 미니게임 및 베팅 로직 함수들 ===
+const toggleReady = () => safePublish(`/app/room/${roomId.value}/ready`, { type: 'READY', sender: playerName.value })
+const selectRps = (choice) => safePublish(`/app/room/${roomId.value}/rps`, { type: 'RPS_CHOICE', sender: playerName.value, data: choice })
+const selectCard = (card) => safePublish(`/app/room/${roomId.value}/selectCard`, { type: 'CARD_SELECT', sender: playerName.value, data: card })
+const guessDice = (guess) => safePublish(`/app/room/${roomId.value}/dice`, { type: 'DICE_GUESS', sender: playerName.value, data: guess })
 
 const sendBet = (action, amount = 0) => {
-  if (roomState.value.currentTurn !== playerName.value) {
-    alert('지금은 상대방의 턴입니다!');
-    return;
-  }
-  safePublish(`/app/room/${roomId}/bet`, { 
-    type: 'BET_ACTION', 
-    sender: playerName.value, 
-    data: { action: action, amount: amount } 
-  })
+  if (roomState.value.currentTurn !== playerName.value) return alert('지금은 상대방의 턴입니다!');
+  safePublish(`/app/room/${roomId.value}/bet`, { type: 'BET_ACTION', sender: playerName.value, data: { action: action, amount: amount } })
 }
 
 const getCallAmount = () => {
@@ -165,22 +171,18 @@ const getCallAmount = () => {
   return roomState.value.highestBet - myBet;
 }
 
-const restartGame = () => {
-  safePublish(`/app/room/${roomId}/restart`, { type: 'RESTART', sender: playerName.value })
-}
+const restartGame = () => safePublish(`/app/room/${roomId.value}/restart`, { type: 'RESTART', sender: playerName.value })
 </script>
 
 <template>
   <div style="padding: 20px; font-family: sans-serif;">
-    <h1>텍사스 홀덤 미니게임 데모</h1>
+    <h1>텍사스 홀덤 미니게임 데모 (다중 방)</h1>
     <p>상태: <strong>{{ connectionStatus }}</strong></p>
     
-    <!-- 관전자 알림 배지 -->
     <div v-if="isSpectator" style="background-color: #607d8b; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 10px; border-radius: 5px;">
-      👁️ 현재 관전 모드로 접속 중입니다. 게임 진행 상황만 볼 수 있습니다.
+      👁️ 현재 관전 모드로 접속 중입니다. (진행 상황만 표시됨)
     </div>
 
-    <!-- 내 핸드 (관전자는 안 보임) -->
     <div v-if="!isSpectator && myHoleCards.length > 0" style="background-color: #f0f8ff; padding: 10px; margin-bottom: 10px; border-radius: 5px;">
       <strong>내 핸드(Hole Cards):</strong> 
       <span v-for="card in myHoleCards" :key="card" style="margin-right: 10px; font-weight: bold; color: #d32f2f;">
@@ -189,17 +191,26 @@ const restartGame = () => {
     </div>
     <hr />
 
-    <!-- 🌟 방 나가기 버튼 (접속 후에만 표시) 🌟 -->
     <div v-if="isJoined" style="text-align: right; margin-bottom: 10px;">
       <button @click="leaveRoom" style="background-color: #757575; color: white; padding: 5px 15px; border: none; border-radius: 4px; cursor: pointer;">
         🚪 방 나가기
       </button>
     </div>
 
-    <div v-if="!isJoined">
-      <h3>플레이어 이름 입력</h3>
-      <input v-model="playerName" placeholder="이름을 입력하세요" />
-      <button @click="joinRoom">방 입장하기</button>
+    <!-- 방 입장 전 UI (다중 방 지원으로 입력 칸 2개) -->
+    <div v-if="!isJoined" style="background: #e0f7fa; padding: 20px; border-radius: 8px;">
+      <h3>방 번호와 이름을 입력하세요</h3>
+      <div style="margin-bottom: 10px;">
+        <label style="display: inline-block; width: 80px; font-weight: bold;">방 이름:</label>
+        <input v-model="roomId" placeholder="예: room123" style="padding: 5px;" />
+      </div>
+      <div style="margin-bottom: 10px;">
+        <label style="display: inline-block; width: 80px; font-weight: bold;">내 이름:</label>
+        <input v-model="playerName" placeholder="닉네임 입력" style="padding: 5px;" @keyup.enter="joinRoom" />
+      </div>
+      <button @click="joinRoom" style="padding: 8px 15px; background: #00838f; color: white; border: none; border-radius: 4px; cursor: pointer;">
+        방 입장하기
+      </button>
     </div>
 
     <div v-if="isJoined && gamePhase === 'LOBBY'">
@@ -220,7 +231,7 @@ const restartGame = () => {
           </li>
         </ul>
       </div>
-      <button v-if="!isSpectator" @click="toggleReady">준비 (Ready)</button>
+      <button v-if="!isSpectator" @click="toggleReady" style="padding: 10px 20px; background: #4caf50; color: white; border: none; cursor: pointer;">준비 (Ready)</button>
     </div>
 
     <div v-if="gamePhase === 'MINIGAME_1'">
@@ -260,7 +271,6 @@ const restartGame = () => {
     <div v-if="gamePhase === 'HOLDEM_MAIN'" style="background-color: #2e7d32; padding: 20px; border-radius: 10px; color: white;">
       <h2 style="text-align: center;">🃏 텍사스 홀덤 테이블 🃏</h2>
       
-      <!-- 게임 종료 / 쇼다운 알림창 -->
       <div v-if="['END', 'SHOWDOWN'].includes(roomState?.holdemPhase)" 
            style="background: #ffb300; color: black; padding: 20px; text-align: center; border-radius: 10px; margin-bottom: 20px;">
         <h2 v-if="roomState?.holdemPhase === 'END'">게임 종료!</h2>
@@ -287,7 +297,6 @@ const restartGame = () => {
       </div>
 
       <div style="display: flex; justify-content: space-between;">
-        <!-- 내 정보 패널 (관전자일 때는 플레이어 1 표시용으로 대체) -->
         <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; width: 45%;">
           <h3>{{ isSpectator ? '👤 플레이어 1' : `👤 ${playerName} (나)` }}</h3>
           <p v-if="!isSpectator">보유 칩: <strong>{{ roomState?.players[playerName]?.chips }}</strong></p>
@@ -312,7 +321,6 @@ const restartGame = () => {
           <div v-if="isSpectator" style="color: yellow; margin-top: 10px;">(진행 중인 플레이어입니다)</div>
         </div>
 
-        <!-- 상대방 정보 패널 -->
         <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; width: 45%; text-align: right;">
           <div v-for="(player, name) in roomState?.players" :key="name" v-show="isSpectator || name !== playerName">
              <h3>🤖 {{ name }} (상대방)</h3>

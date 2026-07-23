@@ -6,13 +6,18 @@ import com.demo.pokerwithgame.pokerwithgame.model.HandEvaluator;
 import com.demo.pokerwithgame.pokerwithgame.model.Player;
 import com.demo.pokerwithgame.pokerwithgame.service.RoomManager;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.event.EventListener;
 import org.springframework.messaging.handler.annotation.DestinationVariable;
 import org.springframework.messaging.handler.annotation.MessageMapping;
 import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
 import org.springframework.stereotype.Controller;
+import org.springframework.web.socket.messaging.SessionDisconnectEvent;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Controller
 @RequiredArgsConstructor
@@ -21,28 +26,67 @@ public class GameController {
     private final RoomManager roomManager;
     private final SimpMessagingTemplate messagingTemplate;
 
+    // 세션 ID와 [방 이름, 플레이어 이름]을 매핑해두는 저장소 (연결 끊김 감지용)
+    private final Map<String, String[]> sessionMap = new ConcurrentHashMap<>();
+
     // 플레이어 방 입장 처리: /app/room/{roomId}/join
     @MessageMapping("/room/{roomId}/join")
-    public void joinRoom(@DestinationVariable String roomId, @Payload GameMessage message) {
+    public void joinRoom(@DestinationVariable String roomId, @Payload GameMessage message, SimpMessageHeaderAccessor headerAccessor) {
         GameRoom room = roomManager.getRoom(roomId);
         String playerName = message.getSender();
 
-        // 이미 접속한 유저가 중복 입장하는 것 방지
+        // 🌟 입장할 때 세션 ID를 기록해 둡니다.
+        String sessionId = headerAccessor.getSessionId();
+        sessionMap.put(sessionId, new String[]{roomId, playerName});
+
         if (!room.getPlayers().containsKey(playerName) && !room.getSpectators().containsKey(playerName)) {
             if (room.getPlayers().size() < 2) {
-                // 2명 미만이면 플레이어로 입장
                 room.getPlayers().put(playerName, new Player(playerName, playerName));
             } else {
-                // 2명 이상이면 관전자로 입장
                 room.getSpectators().put(playerName, new Player(playerName, playerName));
             }
         }
 
-        // 방 상태 업데이트 메시지 발송
         GameMessage response = new GameMessage();
         response.setType("STATE_UPDATE");
         response.setData(room);
         messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+    }
+
+    // 2. 사용자가 탭을 끄거나 새로고침할 때 자동으로 실행되는 이벤트 리스너 추가
+    @EventListener
+    public void handleWebSocketDisconnectListener(SessionDisconnectEvent event) {
+        StompHeaderAccessor headerAccessor = StompHeaderAccessor.wrap(event.getMessage());
+        String sessionId = headerAccessor.getSessionId();
+
+        // 세션 맵에서 어떤 방에 있던 누가 나갔는지 확인
+        if (sessionMap.containsKey(sessionId)) {
+            String[] info = sessionMap.get(sessionId);
+            String roomId = info[0];
+            String playerName = info[1];
+            sessionMap.remove(sessionId);
+
+            GameRoom room = roomManager.getRoom(roomId);
+            if (room != null) {
+                if (room.getPlayers().containsKey(playerName)) {
+                    room.getPlayers().remove(playerName);
+
+                    // 진행 중이었다면 기권승 처리
+                    if (!"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase())) {
+                        room.setHoldemPhase("END");
+                        room.setWinnerMessage("상대방(" + playerName + ")의 통신이 끊어졌습니다! 기권승 🏆");
+                    }
+                } else if (room.getSpectators().containsKey(playerName)) {
+                    room.getSpectators().remove(playerName);
+                }
+
+                // 남은 인원들에게 방 상태 즉시 갱신
+                GameMessage response = new GameMessage();
+                response.setType("STATE_UPDATE");
+                response.setData(room);
+                messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+            }
+        }
     }
 
     // 플레이어 준비 완료 처리: /app/room/{roomId}/ready

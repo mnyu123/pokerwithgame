@@ -8,6 +8,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class GameRoom {
     private String roomId;
     private Map<String, Player> players = new ConcurrentHashMap<>(); // sessionId -> Player
+    private Map<String, Player> spectators = new ConcurrentHashMap<>();
     private List<String> deck = new ArrayList<>();
     private int currentRound = 1; // 1 = 첫번째 미니게임, 2 = 두번째 미니게임, 3 = 홀덤 시작
 

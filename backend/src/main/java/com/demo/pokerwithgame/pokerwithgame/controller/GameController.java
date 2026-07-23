@@ -27,8 +27,16 @@ public class GameController {
         GameRoom room = roomManager.getRoom(roomId);
         String playerName = message.getSender();
 
-        // 방에 플레이어 추가 (데모이므로 세션ID 대신 이름을 식별자로 사용)
-        room.getPlayers().put(playerName, new Player(playerName, playerName));
+        // 이미 접속한 유저가 중복 입장하는 것 방지
+        if (!room.getPlayers().containsKey(playerName) && !room.getSpectators().containsKey(playerName)) {
+            if (room.getPlayers().size() < 2) {
+                // 2명 미만이면 플레이어로 입장
+                room.getPlayers().put(playerName, new Player(playerName, playerName));
+            } else {
+                // 2명 이상이면 관전자로 입장
+                room.getSpectators().put(playerName, new Player(playerName, playerName));
+            }
+        }
 
         // 방 상태 업데이트 메시지 발송
         GameMessage response = new GameMessage();

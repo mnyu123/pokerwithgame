@@ -29,18 +29,17 @@ public class GameController {
     // 세션 ID와 [방 이름, 플레이어 이름]을 매핑해두는 저장소 (연결 끊김 감지용)
     private final Map<String, String[]> sessionMap = new ConcurrentHashMap<>();
 
-    // 플레이어 방 입장 처리: /app/room/{roomId}/join
+    // 1. 입장 로직 (최대 4인으로 확장)
     @MessageMapping("/room/{roomId}/join")
     public void joinRoom(@DestinationVariable String roomId, @Payload GameMessage message, SimpMessageHeaderAccessor headerAccessor) {
         GameRoom room = roomManager.getRoom(roomId);
         String playerName = message.getSender();
-
-        // 🌟 입장할 때 세션 ID를 기록해 둡니다.
+        
         String sessionId = headerAccessor.getSessionId();
         sessionMap.put(sessionId, new String[]{roomId, playerName});
 
         if (!room.getPlayers().containsKey(playerName) && !room.getSpectators().containsKey(playerName)) {
-            if (room.getPlayers().size() < 2) {
+            if (room.getPlayers().size() < 4) { // 🌟 최대 4인으로 변경
                 room.getPlayers().put(playerName, new Player(playerName, playerName));
             } else {
                 room.getSpectators().put(playerName, new Player(playerName, playerName));
@@ -59,7 +58,6 @@ public class GameController {
         StompHeaderAccessor headerAccessor = StompHeaderAccessor.wrap(event.getMessage());
         String sessionId = headerAccessor.getSessionId();
 
-        // 세션 맵에서 어떤 방에 있던 누가 나갔는지 확인
         if (sessionMap.containsKey(sessionId)) {
             String[] info = sessionMap.get(sessionId);
             String roomId = info[0];
@@ -70,17 +68,17 @@ public class GameController {
             if (room != null) {
                 if (room.getPlayers().containsKey(playerName)) {
                     room.getPlayers().remove(playerName);
-
-                    // 진행 중이었다면 기권승 처리
-                    if (!"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase())) {
+                    
+                    // 남은 인원이 1명이면 기권승 처리
+                    long activeCount = room.getPlayers().values().stream().filter(p -> !p.isFolded()).count();
+                    if (!"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase()) && activeCount <= 1) {
                         room.setHoldemPhase("END");
-                        room.setWinnerMessage("상대방(" + playerName + ")의 통신이 끊어졌습니다! 기권승 🏆");
+                        room.setWinnerMessage("다른 플레이어들이 모두 나가서 기권승 처리되었습니다! 🏆");
                     }
                 } else if (room.getSpectators().containsKey(playerName)) {
                     room.getSpectators().remove(playerName);
                 }
 
-                // 남은 인원들에게 방 상태 즉시 갱신
                 GameMessage response = new GameMessage();
                 response.setType("STATE_UPDATE");
                 response.setData(room);
@@ -89,192 +87,161 @@ public class GameController {
         }
     }
 
-    // 플레이어 준비 완료 처리: /app/room/{roomId}/ready
     @MessageMapping("/room/{roomId}/ready")
-    public void ready(@DestinationVariable String roomId, @Payload GameMessage message) {
+    public void toggleReady(@DestinationVariable String roomId, @Payload GameMessage message) {
         GameRoom room = roomManager.getRoom(roomId);
-        Player player = room.getPlayers().get(message.getSender());
+        Player p = room.getPlayers().get(message.getSender());
+        if (p != null) p.setReady(!p.isReady());
 
-        if (player != null) {
-            player.setReady(true);
-        }
-
-        // 방에 2명이 있고, 둘 다 Ready 상태인지 확인
-        boolean allReady = room.getPlayers().size() == 2 &&
-                room.getPlayers().values().stream().allMatch(Player::isReady);
+        // 최소 2명 이상이고, 들어온 '모든' 플레이어가 준비되었을 때 시작
+        boolean allReady = room.getPlayers().size() >= 2 && 
+                           room.getPlayers().values().stream().allMatch(Player::isReady);
 
         if (allReady) {
-            // 모두 준비 완료 -> 1차 미니게임 시작 알림 발송
-            GameMessage startMessage = new GameMessage();
-            startMessage.setType("MINIGAME_1_START");
-            startMessage.setData("가위바위보를 준비하세요!");
-            messagingTemplate.convertAndSend("/topic/room/" + roomId, startMessage);
+            room.setHoldemPhase("MINIGAME_1");
+            GameMessage nextMsg = new GameMessage();
+            nextMsg.setType("MINIGAME_1_START");
+            nextMsg.setData(room);
+            messagingTemplate.convertAndSend("/topic/room/" + roomId, nextMsg);
         } else {
-            // 아직 한 명만 레디한 상태면 방 상태만 업데이트
-            GameMessage response = new GameMessage();
-            response.setType("STATE_UPDATE");
-            response.setData(room);
-            messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+            GameMessage updateMsg = new GameMessage();
+            updateMsg.setType("STATE_UPDATE");
+            updateMsg.setData(room);
+            messagingTemplate.convertAndSend("/topic/room/" + roomId, updateMsg);
         }
     }
 
     // 1차 미니게임 (가위바위보) 처리: /app/room/{roomId}/rps
     @MessageMapping("/room/{roomId}/rps")
-    public void playRps(@DestinationVariable String roomId, @Payload GameMessage message) {
+    public void selectRps(@DestinationVariable String roomId, @Payload GameMessage message) {
         GameRoom room = roomManager.getRoom(roomId);
-        String player = message.getSender();
-        String choice = (String) message.getData(); // "SCISSORS", "ROCK", "PAPER"
+        room.getRpsChoices().put(message.getSender(), (String) message.getData());
 
-        // 플레이어의 선택 저장
-        room.getRpsChoices().put(player, choice);
-
-        // 두 명 모두 선택을 완료했는지 확인
-        if (room.getRpsChoices().size() == 2) {
+        if (room.getRpsChoices().size() == room.getPlayers().size()) {
             evaluateRpsAndSendResult(roomId, room);
         }
     }
 
     // 가위바위보 승패 판정 및 5장 뽑기 로직
     private void evaluateRpsAndSendResult(String roomId, GameRoom room) {
-        // 방에 있는 두 명의 플레이어 이름 추출
-        List<String> playerNames = new ArrayList<>(room.getRpsChoices().keySet());
-        String p1 = playerNames.get(0);
-        String p2 = playerNames.get(1);
-        String c1 = room.getRpsChoices().get(p1);
-        String c2 = room.getRpsChoices().get(p2);
+        String[] rps = {"ROCK", "PAPER", "SCISSORS"};
+        String serverChoice = rps[new Random().nextInt(3)]; // 서버가 임의로 선택
 
-        // 무승부 처리
-        if (c1.equals(c2)) {
-            room.getRpsChoices().clear(); // 선택 초기화 후 재경기
-            GameMessage drawMsg = new GameMessage();
-            drawMsg.setType("MINIGAME_1_DRAW");
-            messagingTemplate.convertAndSend("/topic/room/" + roomId, drawMsg);
-            return;
-        }
-
-        // 승자 판정
-        String winner = null;
-        String loser = null;
-        if ((c1.equals("SCISSORS") && c2.equals("PAPER")) ||
-                (c1.equals("ROCK") && c2.equals("SCISSORS")) ||
-                (c1.equals("PAPER") && c2.equals("ROCK"))) {
-            winner = p1; loser = p2;
-        } else {
-            winner = p2; loser = p1;
-        }
-
-        // 덱에서 5장을 뽑아서 방 상태에 임시 저장
-        List<String> fiveCards = room.drawCards(5);
-        room.setCurrentFiveCards(fiveCards);
-
-        // 결과를 묶어서 프론트엔드로 전송
         Map<String, Object> resultData = new HashMap<>();
-        resultData.put("winner", winner);
-        resultData.put("loser", loser);
-        resultData.put("cards", fiveCards); // 5장의 카드 배열 전송
+        resultData.put("serverChoice", serverChoice);
+
+        for (Player p : room.getPlayers().values()) {
+            String pChoice = room.getRpsChoices().get(p.getPlayerName());
+            boolean isWin = false;
+
+            if (pChoice.equals("ROCK") && serverChoice.equals("SCISSORS")) isWin = true;
+            if (pChoice.equals("SCISSORS") && serverChoice.equals("PAPER")) isWin = true;
+            if (pChoice.equals("PAPER") && serverChoice.equals("ROCK")) isWin = true;
+
+            Map<String, Object> pResult = new HashMap<>();
+            pResult.put("isWin", isWin);
+            
+            if (isWin) {
+                pResult.put("cards", room.drawCards(5)); // 이기면 5장 선택권 부여
+            } else {
+                p.getHoleCards().add(room.drawCards(1).get(0)); // 지거나 비기면 랜덤 1장 즉시 부여
+                pResult.put("cards", new ArrayList<>());
+            }
+            resultData.put(p.getPlayerName(), pResult);
+        }
+
+        room.getRpsChoices().clear();
+        resultData.put("roomState", room);
 
         GameMessage resultMsg = new GameMessage();
         resultMsg.setType("MINIGAME_1_RESULT");
         resultMsg.setData(resultData);
         messagingTemplate.convertAndSend("/topic/room/" + roomId, resultMsg);
+
+        // 모두가 카드를 1장씩 가지게 되었다면 바로 2차 미니게임으로
+        checkNextPhase(room, roomId, 1, "MINIGAME_2_START");
     }
 
     // 카드 선택 처리: /app/room/{roomId}/selectCard
     @MessageMapping("/room/{roomId}/selectCard")
     public void selectCard(@DestinationVariable String roomId, @Payload GameMessage message) {
         GameRoom room = roomManager.getRoom(roomId);
-        String winnerName = message.getSender();
-        String selectedCard = (String) message.getData();
-
-        Player picker = room.getPlayers().get(winnerName);
-        picker.getHoleCards().add(selectedCard);
-
-        // 1장째 획득(가위바위보 직후)인 경우: 패자에게 남은 카드 중 1장 랜덤 지급
-        if (picker.getHoleCards().size() == 1) {
-            List<String> remainingCards = new ArrayList<>(room.getCurrentFiveCards());
-            remainingCards.remove(selectedCard);
-            Collections.shuffle(remainingCards);
-            String loserCard = remainingCards.get(0);
-
-            Player loser = room.getPlayers().values().stream()
-                    .filter(p -> !p.getPlayerName().equals(winnerName))
-                    .findFirst().orElse(null);
-
-            if (loser != null) {
-                loser.getHoleCards().add(loserCard);
-            }
-            room.getCurrentFiveCards().clear();
-            room.getRpsChoices().clear();
-
-            // 2차 미니게임(주사위) 시작
-            GameMessage nextPhaseMsg = new GameMessage();
-            nextPhaseMsg.setType("MINIGAME_2_START");
-            nextPhaseMsg.setData(room);
-            messagingTemplate.convertAndSend("/topic/room/" + roomId, nextPhaseMsg);
+        Player picker = room.getPlayers().get(message.getSender());
+        
+        if (picker != null) {
+            picker.getHoleCards().add((String) message.getData());
         }
-        // 2장째 획득(주사위 직후)인 경우: 바로 홀덤 시작 판정
-        else {
-            checkHoldemPhaseAndSend(room, roomId);
-        }
+
+        // 각 상황에 맞춰 다음 페이즈로 자동으로 넘어가는지 체크
+        checkNextPhase(room, roomId, 1, "MINIGAME_2_START");
+        checkNextPhase(room, roomId, 2, "HOLDEM_START");
     }
 
     // 2. selectCard 메서드 아래에 새로운 베팅 처리 엔드포인트를 추가하세요.
     @MessageMapping("/room/{roomId}/bet")
     public void processBet(@DestinationVariable String roomId, @Payload GameMessage message) {
         GameRoom room = roomManager.getRoom(roomId);
-        String player = message.getSender();
+        String sender = message.getSender();
+        
+        if (!sender.equals(room.getCurrentTurn())) return;
 
-        if (!player.equals(room.getCurrentTurn())) return; // 내 턴이 아니면 무시
+        Player currentPlayer = room.getPlayers().get(sender);
+        Map<String, Object> data = (Map<String, Object>) message.getData();
+        String action = (String) data.get("action");
+        int amount = data.containsKey("amount") ? (int) data.get("amount") : 0;
 
-        Map<String, Object> betData = (Map<String, Object>) message.getData();
-        String action = (String) betData.get("action"); // "FOLD", "CHECK", "CALL", "RAISE"
-        // 안전한 형변환
-        int amount = betData.containsKey("amount") ? ((Number) betData.get("amount")).intValue() : 0;
-
-        Player currentPlayer = room.getPlayers().get(player);
-        Player opponent = room.getPlayers().values().stream()
-                .filter(p -> !p.getPlayerName().equals(player))
-                .findFirst().orElse(null);
-
-        currentPlayer.setHasActed(true); // 행동 완료 처리
+        currentPlayer.setHasActed(true);
 
         if ("FOLD".equals(action)) {
             currentPlayer.setFolded(true);
-            room.setHoldemPhase("END");
-            opponent.setChips(opponent.getChips() + room.getPot());
-            room.setWinnerMessage(opponent.getPlayerName() + " 기권승! (상대방 폴드)");
-        }
-        else if ("RAISE".equals(action) || "CALL".equals(action)) {
-            // 콜인 경우 차액만 계산
-            if ("CALL".equals(action)) {
-                amount = room.getHighestBet() - currentPlayer.getCurrentBet();
+            
+            // 본인이 폴드했는데 남은 사람이 1명이면 그 사람의 승리로 즉시 종료
+            List<Player> activePlayers = room.getPlayers().values().stream().filter(p -> !p.isFolded()).toList();
+            if (activePlayers.size() == 1) {
+                room.setHoldemPhase("END");
+                Player winner = activePlayers.get(0);
+                winner.setChips(winner.getChips() + room.getPot());
+                room.setWinnerMessage(winner.getPlayerName() + " 승리! 🏆 (나머지 모두 기권)");
+                
+                GameMessage response = new GameMessage();
+                response.setType("STATE_UPDATE");
+                response.setData(room);
+                messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+                return;
             }
+        } else if ("CALL".equals(action)) {
+            int callAmount = room.getHighestBet() - currentPlayer.getCurrentBet();
+            currentPlayer.setChips(currentPlayer.getChips() - callAmount);
+            currentPlayer.setCurrentBet(currentPlayer.getCurrentBet() + callAmount);
+            room.setPot(room.getPot() + callAmount);
+        } else if ("RAISE".equals(action)) {
+            int raiseAmount = room.getHighestBet() - currentPlayer.getCurrentBet() + amount;
+            currentPlayer.setChips(currentPlayer.getChips() - raiseAmount);
+            currentPlayer.setCurrentBet(currentPlayer.getCurrentBet() + raiseAmount);
+            room.setPot(room.getPot() + raiseAmount);
+            room.setHighestBet(currentPlayer.getCurrentBet());
 
-            currentPlayer.setChips(currentPlayer.getChips() - amount);
-            currentPlayer.setCurrentBet(currentPlayer.getCurrentBet() + amount);
-            room.setPot(room.getPot() + amount);
-
-            if (currentPlayer.getCurrentBet() > room.getHighestBet()) {
-                room.setHighestBet(currentPlayer.getCurrentBet());
-                opponent.setHasActed(false); // 상대방이 다시 콜/레이즈를 해야 하므로 행동 상태 초기화
-            }
+            // 레이즈가 나오면 다른 사람들은 다시 액션을 취해야 하므로 hasActed 초기화
+            room.getPlayers().values().stream()
+                .filter(p -> !p.isFolded() && !p.getPlayerName().equals(sender))
+                .forEach(p -> p.setHasActed(false));
         }
 
-        // 라운드 종료 판정: 둘 다 행동을 했고, 베팅 금액이 같으면 다음 페이즈로 이동
-        if (!"END".equals(room.getHoldemPhase()) &&
-                currentPlayer.isHasActed() && opponent.isHasActed() &&
-                currentPlayer.getCurrentBet() == opponent.getCurrentBet()) {
+        // 라운드 종료 체크: 폴드하지 않은 모두가 액션을 했고, 모두의 베팅금이 최고 베팅금과 일치하는지
+        boolean roundOver = room.getPlayers().values().stream()
+                .filter(p -> !p.isFolded())
+                .allMatch(p -> p.isHasActed() && p.getCurrentBet() == room.getHighestBet());
 
+        if (roundOver) {
             nextPhase(room);
-        } else if (!"END".equals(room.getHoldemPhase())) {
-            // 라운드가 안 끝났으면 턴 넘기기
-            room.setCurrentTurn(opponent.getPlayerName());
+        } else {
+            room.setCurrentTurn(getNextTurn(room, currentPlayer.getPlayerName()));
         }
 
-        GameMessage updateMsg = new GameMessage();
-        updateMsg.setType("STATE_UPDATE");
-        updateMsg.setData(room);
-        messagingTemplate.convertAndSend("/topic/room/" + roomId, updateMsg);
+        GameMessage response = new GameMessage();
+        response.setType("STATE_UPDATE");
+        response.setData(room);
+        messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
     }
 
     // 2. processBet 바로 아래에 페이즈 전환 메서드를 추가하세요.
@@ -284,9 +251,7 @@ public class GameController {
             p.setHasActed(false);
         });
         room.setHighestBet(0);
-
-        String firstPlayer = new ArrayList<>(room.getPlayers().keySet()).get(0);
-        room.setCurrentTurn(firstPlayer);
+        room.setCurrentTurn(getNextTurn(room, null));
 
         String currentPhase = room.getHoldemPhase();
         if ("PRE_FLOP".equals(currentPhase)) {
@@ -300,7 +265,7 @@ public class GameController {
             room.getCommunityCards().addAll(room.drawCards(1));
         } else if ("RIVER".equals(currentPhase)) {
             room.setHoldemPhase("SHOWDOWN");
-            evaluateShowdown(room); // 승패 자동 판정!
+            evaluateShowdown(room);
         }
     }
 
@@ -309,97 +274,120 @@ public class GameController {
         List<Player> active = room.getPlayers().values().stream()
                 .filter(p -> !p.isFolded()).toList();
 
-        if (active.size() == 2) {
-            Player p1 = active.get(0);
-            Player p2 = active.get(1);
+        if (!active.isEmpty()) {
+            long maxScore = -1;
+            List<Player> winners = new ArrayList<>();
+            Map<String, String> handNames = new HashMap<>();
 
-            HandEvaluator.HandResult r1 = HandEvaluator.evaluate(p1.getHoleCards(), room.getCommunityCards());
-            HandEvaluator.HandResult r2 = HandEvaluator.evaluate(p2.getHoleCards(), room.getCommunityCards());
+            for (Player p : active) {
+                HandEvaluator.HandResult r = HandEvaluator.evaluate(p.getHoleCards(), room.getCommunityCards());
+                handNames.put(p.getPlayerName(), r.handName);
+                
+                if (r.score > maxScore) {
+                    maxScore = r.score;
+                    winners.clear();
+                    winners.add(p);
+                } else if (r.score == maxScore) {
+                    winners.add(p); // 동점자 발생
+                }
+            }
 
-            if (r1.score > r2.score) {
-                p1.setChips(p1.getChips() + room.getPot());
-                room.setWinnerMessage(p1.getPlayerName() + " 승리! 🏆 (" + r1.handName + ")");
-            } else if (r2.score > r1.score) {
-                p2.setChips(p2.getChips() + room.getPot());
-                room.setWinnerMessage(p2.getPlayerName() + " 승리! 🏆 (" + r2.handName + ")");
+            // 승자끼리 팟 분할
+            int splitPot = room.getPot() / winners.size();
+            StringBuilder winnerMsg = new StringBuilder();
+            
+            for (Player w : winners) {
+                w.setChips(w.getChips() + splitPot);
+                winnerMsg.append(w.getPlayerName()).append("(").append(handNames.get(w.getPlayerName())).append(") ");
+            }
+            
+            if (winners.size() == 1) {
+                room.setWinnerMessage(winnerMsg.toString() + "승리! 🏆");
             } else {
-                // 무승부 (팟 스플릿)
-                p1.setChips(p1.getChips() + room.getPot() / 2);
-                p2.setChips(p2.getChips() + room.getPot() / 2);
-                room.setWinnerMessage("무승부! 🤝 (" + r1.handName + ") - 팟을 나눕니다.");
+                room.setWinnerMessage(winnerMsg.toString() + " - 공동 우승! 🤝 팟을 나눕니다.");
             }
         }
     }
 
     // selectCard 메서드 아래에 새로운 주사위 판정 엔드포인트 추가!
     @MessageMapping("/room/{roomId}/dice")
-    public void playDice(@DestinationVariable String roomId, @Payload GameMessage message) {
+    public void guessDice(@DestinationVariable String roomId, @Payload GameMessage message) {
         GameRoom room = roomManager.getRoom(roomId);
-        String player = message.getSender();
-        String guess = (String) message.getData(); // "ODD" (홀) 또는 "EVEN" (짝)
+        room.getDiceGuesses().put(message.getSender(), (String) message.getData());
 
-        room.getDiceGuesses().put(player, guess);
-
-        if (room.getDiceGuesses().size() == 2) {
+        if (room.getDiceGuesses().size() == room.getPlayers().size()) {
             evaluateDiceAndSendResult(roomId, room);
         }
     }
 
     private void evaluateDiceAndSendResult(String roomId, GameRoom room) {
-        List<String> playerNames = new ArrayList<>(room.getDiceGuesses().keySet());
-        String p1Name = playerNames.get(0);
-        String p2Name = playerNames.get(1);
-        String g1 = room.getDiceGuesses().get(p1Name);
-        String g2 = room.getDiceGuesses().get(p2Name);
-
-        // 주사위 굴리기
         int diceNumber = new Random().nextInt(6) + 1;
         String actualResult = (diceNumber % 2 == 0) ? "EVEN" : "ODD";
-
-        boolean p1Correct = g1.equals(actualResult);
-        boolean p2Correct = g2.equals(actualResult);
-
-        Player p1 = room.getPlayers().get(p1Name);
-        Player p2 = room.getPlayers().get(p2Name);
 
         Map<String, Object> resultData = new HashMap<>();
         resultData.put("diceNumber", diceNumber);
 
-        // P1 개별 처리
-        Map<String, Object> p1Result = new HashMap<>();
-        p1Result.put("isCorrect", p1Correct);
-        if (p1Correct) {
-            p1Result.put("cards", room.drawCards(5)); // 맞추면 5장 제공
-        } else {
-            p1.getHoleCards().add(room.drawCards(1).get(0)); // 틀리면 바로 1장 강제 지급
-            p1Result.put("cards", new ArrayList<>());
-        }
+        // 모든 플레이어를 순회하며 개별 판정
+        for (Player p : room.getPlayers().values()) {
+            String guess = room.getDiceGuesses().get(p.getPlayerName());
+            boolean isCorrect = actualResult.equals(guess);
 
-        // P2 개별 처리
-        Map<String, Object> p2Result = new HashMap<>();
-        p2Result.put("isCorrect", p2Correct);
-        if (p2Correct) {
-            p2Result.put("cards", room.drawCards(5));
-        } else {
-            p2.getHoleCards().add(room.drawCards(1).get(0));
+            Map<String, Object> pResult = new HashMap<>();
+            pResult.put("isCorrect", isCorrect);
+            if (isCorrect) {
+                pResult.put("cards", room.drawCards(5));
+            } else {
+                p.getHoleCards().add(room.drawCards(1).get(0));
+                pResult.put("cards", new ArrayList<>());
+            }
+            resultData.put(p.getPlayerName(), pResult);
         }
-
-        resultData.put(p1Name, p1Result);
-        resultData.put(p2Name, p2Result);
-        resultData.put("roomState", room);
 
         room.getDiceGuesses().clear();
+        resultData.put("roomState", room);
 
-        // 프론트엔드로 각각의 결과 발송
         GameMessage resultMsg = new GameMessage();
         resultMsg.setType("MINIGAME_2_RESULT");
         resultMsg.setData(resultData);
         messagingTemplate.convertAndSend("/topic/room/" + roomId, resultMsg);
 
-        // 만약 둘 다 틀려서 이미 카드가 2장씩 다 찼다면, 즉시 홀덤 시작!
-        if (!p1Correct && !p2Correct) {
-            checkHoldemPhaseAndSend(room, roomId);
+        checkNextPhase(room, roomId, 2, "HOLDEM_START");
+    }
+
+    // 🌟 페이즈 전환 공통 체크 로직 (모두가 N장의 카드를 가졌는지 확인)
+    private void checkNextPhase(GameRoom room, String roomId, int targetCardCount, String nextPhaseType) {
+        boolean allReady = room.getPlayers().values().stream()
+                .allMatch(p -> p.getHoleCards().size() == targetCardCount);
+
+        if (allReady) {
+            if (nextPhaseType.equals("HOLDEM_START")) {
+                room.setHoldemPhase("PRE_FLOP");
+                room.setCurrentTurn(getNextTurn(room, null)); // 알파벳 순서 기반 첫 턴 지정
+            }
+            
+            GameMessage nextPhaseMsg = new GameMessage();
+            nextPhaseMsg.setType(nextPhaseType);
+            nextPhaseMsg.setData(room);
+            messagingTemplate.convertAndSend("/topic/room/" + roomId, nextPhaseMsg);
         }
+    }
+
+    // 🌟 3~4인용 알파벳 순서 기반 안정적인 턴 계산 로직
+    private String getNextTurn(GameRoom room, String currentTurn) {
+        List<String> activePlayers = room.getPlayers().values().stream()
+                .filter(p -> !p.isFolded())
+                .map(Player::getPlayerName)
+                .sorted() // 순서 꼬임을 방지하기 위해 플레이어 이름을 정렬하여 순환
+                .toList();
+
+        if (activePlayers.isEmpty()) return null;
+        if (currentTurn == null) return activePlayers.get(0);
+
+        int currentIndex = activePlayers.indexOf(currentTurn);
+        if (currentIndex == -1 || currentIndex == activePlayers.size() - 1) {
+            return activePlayers.get(0);
+        }
+        return activePlayers.get(currentIndex + 1);
     }
 
     private void checkHoldemPhaseAndSend(GameRoom room, String roomId) {

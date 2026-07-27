@@ -6,7 +6,7 @@ export const connectionStatus = ref('연결 중...')
 export const stompClient = ref(null)
 export const playerName = ref('')
 export const roomId = ref('')
-export let currentSubscription = null
+export const currentSubscription = ref(null)
 
 export const isJoined = ref(false)
 export const roomState = ref(null)
@@ -36,9 +36,9 @@ export const safePublish = (destination, payload) => {
 // 방 나가기 및 초기화 함수
 export const leaveRoom = () => {
   safePublish(`/app/room/${roomId.value}/leave`, { type: 'LEAVE', sender: playerName.value })
-  if (currentSubscription) {
-    currentSubscription.unsubscribe()
-    currentSubscription = null
+  if (currentSubscription.value) { // 🌟 .value 추가
+    currentSubscription.value.unsubscribe()
+    currentSubscription.value = null
   }
   isJoined.value = false
   gamePhase.value = 'LOBBY'

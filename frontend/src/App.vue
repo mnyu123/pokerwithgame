@@ -42,9 +42,11 @@ const handleBeforeUnload = () => {
 const joinRoom = () => {
   if (!playerName.value.trim() || !roomId.value.trim()) return alert('방 이름과 이름을 모두 입력해주세요!')
   
-  if (currentSubscription) currentSubscription.unsubscribe()
+  // 🌟 .value를 붙여서 참조 값을 수정합니다.
+  if (currentSubscription.value) currentSubscription.value.unsubscribe()
 
-  currentSubscription = stompClient.value.subscribe(`/topic/room/${roomId.value}`, (message) => {
+  // 🌟 여기서도 .value 에 할당합니다.
+  currentSubscription.value = stompClient.value.subscribe(`/topic/room/${roomId.value}`, (message) => {
     const payload = JSON.parse(message.body)
     
     if (payload.type === 'STATE_UPDATE') {

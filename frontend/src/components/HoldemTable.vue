@@ -1,12 +1,32 @@
 <script setup>
+import { ref, computed, watch } from 'vue'
 import { roomState, playerName, isSpectator, myHoleCards, sendBet, getCallAmount, restartGame } from '../store.js'
 import PlayingCard from './PlayingCard.vue'
+
+// 🌟 슬라이더로 조절할 커스텀 레이즈 금액 (기본값 100)
+const customRaiseAmount = ref(100)
+
+// 🌟 내 남은 칩에서 콜(Call) 비용을 빼고, 추가로 걸 수 있는 최대 칩 계산
+const maxRaiseable = computed(() => {
+  if (!roomState.value || isSpectator.value) return 0;
+  const myChips = roomState.value.players[playerName.value]?.chips || 0;
+  const callCost = getCallAmount();
+  return Math.max(0, myChips - callCost);
+})
+
+// 내 턴이 오거나 칩이 변동될 때, 슬라이더 값이 최대치를 넘지 않도록 안전하게 보정
+watch(maxRaiseable, (newMax) => {
+  if (customRaiseAmount.value > newMax) {
+    customRaiseAmount.value = newMax > 0 ? newMax : 0;
+  }
+})
 </script>
 
 <template>
   <div style="background-color: #2e7d32; padding: 20px; border-radius: 10px; color: white;">
     <h2 style="text-align: center;">🃏 텍사스 홀덤 테이블 🃏</h2>
     
+    <!-- 게임 종료 / 쇼다운 알림창 -->
     <div v-if="['END', 'SHOWDOWN'].includes(roomState?.holdemPhase)" style="background: #ffb300; color: black; padding: 20px; text-align: center; border-radius: 10px; margin-bottom: 20px;">
       <h2 v-if="roomState?.holdemPhase === 'END'">게임 종료!</h2>
       <h2 v-if="roomState?.holdemPhase === 'SHOWDOWN'">패 공개! (SHOWDOWN)</h2>
@@ -18,11 +38,11 @@ import PlayingCard from './PlayingCard.vue'
       </button>
     </div>
 
+    <!-- 중앙 팟(POT) 및 커뮤니티 카드 -->
     <div style="text-align: center; margin: 20px 0; padding: 15px; background: rgba(0,0,0,0.3); border-radius: 8px;">
       <h3>💰 총 상금 (POT): {{ roomState?.pot }} 칩</h3>
       <p>현재 단계: <strong>{{ roomState?.holdemPhase }}</strong></p>
       
-      <!-- 커뮤니티 카드 이미지 출력 -->
       <div style="display: flex; justify-content: center; gap: 10px; min-height: 84px; margin-top: 15px;">
         <PlayingCard v-for="card in roomState?.communityCards" :key="card" :card="card" />
       </div>
@@ -39,19 +59,44 @@ import PlayingCard from './PlayingCard.vue'
           <PlayingCard v-for="card in myHoleCards" :key="card" :card="card" />
         </div>
         
+        <!-- 🌟 베팅 컨트롤 UI 영역 🌟 -->
         <div v-if="!isSpectator && roomState?.currentTurn === playerName && !['END', 'SHOWDOWN'].includes(roomState?.holdemPhase)" style="margin-top: 10px;">
           <p style="color: yellow;">👉 당신의 턴입니다!</p>
-          <button v-if="getCallAmount() === 0" @click="sendBet('CHECK', 0)" style="margin-right: 5px; padding: 10px;">체크 (Check)</button>
-          <button v-else @click="sendBet('CALL', 0)" style="margin-right: 5px; padding: 10px;">콜 (Call {{ getCallAmount() }}칩)</button>
-          <button @click="sendBet('RAISE', 100)" style="margin-right: 5px; padding: 10px;">레이즈 (Raise 100)</button>
-          <button @click="sendBet('FOLD', 0)" style="background-color: #d32f2f; color: white; border: none; padding: 10px;">폴드 (Fold)</button>
+          
+          <button v-if="getCallAmount() === 0" @click="sendBet('CHECK', 0)" style="margin-right: 5px; padding: 10px; cursor: pointer;">체크 (Check)</button>
+          <button v-else @click="sendBet('CALL', 0)" style="margin-right: 5px; padding: 10px; cursor: pointer;">콜 (Call {{ getCallAmount() }}칩)</button>
+          
+          <!-- 슬라이더 및 올인 버튼 (올릴 수 있는 칩이 있을 때만 표시) -->
+          <div v-if="maxRaiseable > 0" style="display: inline-block; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; margin: 5px; vertical-align: top;">
+            <div style="margin-bottom: 5px; text-align: left;">
+              <span style="color: #ffcc80; font-size: 13px; font-weight: bold;">➕ 추가 레이즈: {{ customRaiseAmount }} 칩</span>
+            </div>
+            <input 
+              type="range" 
+              min="10" 
+              :max="maxRaiseable" 
+              step="10" 
+              v-model.number="customRaiseAmount" 
+              style="width: 150px; cursor: pointer;"
+            >
+            <div style="margin-top: 5px;">
+              <button @click="sendBet('RAISE', customRaiseAmount)" style="margin-right: 5px; padding: 8px 12px; background-color: #fbc02d; color: black; border: none; font-weight: bold; cursor: pointer; border-radius: 4px;">
+                레이즈
+              </button>
+              <button @click="sendBet('RAISE', maxRaiseable)" style="padding: 8px 12px; background-color: #d32f2f; color: white; border: none; font-weight: bold; cursor: pointer; border-radius: 4px;">
+                올인! (ALL-IN)
+              </button>
+            </div>
+          </div>
+
+          <button @click="sendBet('FOLD', 0)" style="background-color: #757575; color: white; border: none; padding: 10px; margin-left: 5px; cursor: pointer; border-radius: 4px;">폴드 (Fold)</button>
         </div>
         <div v-else-if="!isSpectator && !['END', 'SHOWDOWN'].includes(roomState?.holdemPhase)" style="margin-top: 10px; color: #ccc;">
           ⏳ 상대방의 결정을 기다리는 중...
         </div>
       </div>
 
-      <!-- 상대방 패널 (여러 명이 들어갈 수 있도록 flex-wrap 적용) -->
+      <!-- 상대방 패널 -->
       <div style="width: 50%; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end;">
         <div v-for="(player, name) in roomState?.players" :key="name" v-show="isSpectator || name !== playerName" 
              style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; width: 100%; text-align: right;">

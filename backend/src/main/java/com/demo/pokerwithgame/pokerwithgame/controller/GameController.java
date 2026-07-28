@@ -81,23 +81,27 @@ public class GameController {
 
             GameRoom room = roomManager.getRoom(roomId);
             if (room != null) {
-                if (room.getPlayers().containsKey(playerName)) {
+                boolean wasPlayer = room.getPlayers().containsKey(playerName);
+                if (wasPlayer) {
                     room.getPlayers().remove(playerName);
-                    
-                    // 남은 인원이 1명이면 기권승 처리
-                    long activeCount = room.getPlayers().values().stream().filter(p -> !p.isFolded()).count();
-                    if (!"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase()) && activeCount <= 1) {
-                        room.setHoldemPhase("END");
-                        room.setWinnerMessage("다른 플레이어들이 모두 나가서 기권승 처리되었습니다! 🏆");
-                    }
                 } else if (room.getSpectators().containsKey(playerName)) {
                     room.getSpectators().remove(playerName);
                 }
 
-                GameMessage response = new GameMessage();
-                response.setType("STATE_UPDATE");
-                response.setData(room);
-                messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+                // 모든 플레이어와 관전자가 방을 나갔다면, 방의 상태를 완전히 초기화합니다.
+                if (room.getPlayers().isEmpty() && room.getSpectators().isEmpty()) {
+                    performRoomReset(room);
+                } else {
+                    // 게임 중 플레이어가 나갔고, 남은 인원이 1명 이하면 기권승 처리
+                    if (wasPlayer && room.getPlayers().size() <= 1 && !"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase())) {
+                        room.setHoldemPhase("END");
+                        room.setWinnerMessage("다른 플레이어들이 모두 나가서 기권승 처리되었습니다! 🏆");
+                    }
+                    GameMessage response = new GameMessage();
+                    response.setType("STATE_UPDATE");
+                    response.setData(room);
+                    messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+                }
             }
         }
     }
@@ -475,27 +479,49 @@ public class GameController {
     @MessageMapping("/room/{roomId}/restart")
     public void restartGame(@DestinationVariable String roomId, @Payload GameMessage message) {
         GameRoom room = roomManager.getRoom(roomId);
+        handleRestart(room);
+    }
 
-        // 방 상태 초기화
-        room.setPot(0);
-        room.getCommunityCards().clear();
-        room.setHighestBet(0);
-        room.setHoldemPhase("LOBBY");
-        room.getCurrentFiveCards().clear();
-        room.getRpsChoices().clear();
-        room.getDiceGuesses().clear();
-        room.setBaseDiceNumber(0);
-        room.setWinnerMessage(null); // 방 상태 초기화 부분에 추가
-        room.setDealerPosition(-1); // 딜러 버튼 위치 초기화
+    // 플레이어 방 퇴장 처리: /app/room/{roomId}/leave
+    @MessageMapping("/room/{roomId}/leave")
+    public void leaveRoom(@DestinationVariable String roomId, @Payload GameMessage message) {
+        GameRoom room = roomManager.getRoom(roomId);
+        String playerName = message.getSender();
 
-        // 플레이어 상태 초기화 (칩은 유지)
-        for (Player p : room.getPlayers().values()) {
-            p.getHoleCards().clear();
-            p.setCurrentBet(0);
-            p.setFolded(false);
-            p.setHasActed(false);
-            p.setReady(false); // 다시 Ready를 눌러야 미니게임 시작
+        boolean wasPlayer = room.getPlayers().containsKey(playerName);
+
+        // 1. 플레이어 목록에서 제거
+        if (wasPlayer) {
+            room.getPlayers().remove(playerName);
         }
+        // 2. 관전자 목록에서 제거
+        else if (room.getSpectators().containsKey(playerName)) {
+            room.getSpectators().remove(playerName);
+        }
+
+        // 모든 플레이어와 관전자가 방을 나갔다면, 방의 상태를 완전히 초기화합니다.
+        if (room.getPlayers().isEmpty() && room.getSpectators().isEmpty()) {
+            performRoomReset(room);
+        } else {
+            // 게임 진행 중에 나갔다면 남은 사람의 승리로 게임 종료 처리
+            if (wasPlayer && !"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase())) {
+                room.setHoldemPhase("END");
+                room.setWinnerMessage("상대방(" + playerName + ")이 도망갔습니다! 기권승 🏆");
+            }
+            // 3. 변경된 방 상태를 남은 사람들에게 브로드캐스트
+            GameMessage response = new GameMessage();
+            response.setType("STATE_UPDATE");
+            response.setData(room);
+            messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+        }
+    }
+
+    /**
+     * 게임 재시작 로직을 처리합니다. 방 상태를 초기화하고, 파산한 플레이어를 처리한 후 상태를 전송합니다.
+     * @param room 재시작할 게임방
+     */
+    private void handleRestart(GameRoom room) {
+        performRoomReset(room);
 
         // 칩이 0이 된 플레이어를 관전자로 이동
         List<Player> bankruptPlayers = new ArrayList<>();
@@ -512,35 +538,32 @@ public class GameController {
         GameMessage updateMsg = new GameMessage();
         updateMsg.setType("STATE_UPDATE");
         updateMsg.setData(room);
-        messagingTemplate.convertAndSend("/topic/room/" + roomId, updateMsg);
+        messagingTemplate.convertAndSend("/topic/room/" + room.getRoomId(), updateMsg);
     }
 
-    // 플레이어 방 퇴장 처리: /app/room/{roomId}/leave
-    @MessageMapping("/room/{roomId}/leave")
-    public void leaveRoom(@DestinationVariable String roomId, @Payload GameMessage message) {
-        GameRoom room = roomManager.getRoom(roomId);
-        String playerName = message.getSender();
+    /**
+     * 게임방의 모든 상태를 초기화합니다. (플레이어 목록과 칩 정보는 유지)
+     * @param room 초기화할 게임방 객체
+     */
+    private void performRoomReset(GameRoom room) {
+        room.setPot(0);
+        room.getCommunityCards().clear();
+        room.setHighestBet(0);
+        room.setHoldemPhase("LOBBY");
+        room.getCurrentFiveCards().clear();
+        room.getRpsChoices().clear();
+        room.getDiceGuesses().clear();
+        room.setBaseDiceNumber(0);
+        room.setWinnerMessage(null);
+        room.setDealerPosition(-1);
 
-        // 1. 플레이어 목록에서 제거
-        if (room.getPlayers().containsKey(playerName)) {
-            room.getPlayers().remove(playerName);
-
-            // 게임 진행 중에 나갔다면 남은 사람의 승리로 게임 종료 처리
-            if (!"LOBBY".equals(room.getHoldemPhase()) && !"END".equals(room.getHoldemPhase())) {
-                room.setHoldemPhase("END");
-                room.setWinnerMessage("상대방(" + playerName + ")이 도망갔습니다! 기권승 🏆");
-            }
+        for (Player p : room.getPlayers().values()) {
+            p.getHoleCards().clear();
+            p.setCurrentBet(0);
+            p.setFolded(false);
+            p.setHasActed(false);
+            p.setReady(false);
         }
-        // 2. 관전자 목록에서 제거
-        else if (room.getSpectators().containsKey(playerName)) {
-            room.getSpectators().remove(playerName);
-        }
-
-        // 3. 변경된 방 상태를 남은 사람들에게 브로드캐스트
-        GameMessage response = new GameMessage();
-        response.setType("STATE_UPDATE");
-        response.setData(room);
-        messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
     }
 
     // --- 방 목록 조회를 위한 REST API ---

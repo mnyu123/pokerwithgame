@@ -18,6 +18,7 @@ public class GameRoom {
     private List<String> currentFiveCards = new ArrayList<>();
 
     private Map<String, String> diceGuesses = new ConcurrentHashMap<>(); // "ODD" 또는 "EVEN"
+    private int baseDiceNumber; // 2차 미니게임 기준 주사위 숫자
 
     private String winnerMessage; // 예: "Player1 승리! (플러시)"
 
@@ -27,6 +28,7 @@ public class GameRoom {
     private String currentTurn; // 현재 베팅할 플레이어 이름
     private String holdemPhase = "PRE_FLOP"; // PRE_FLOP, FLOP, TURN, RIVER, SHOWDOWN
     private int highestBet = 0; // 현재 라운드의 최대 베팅금 (콜을 위해 필요)
+    private int dealerPosition = -1; // 딜러 버튼 인덱스 (매 라운드 순환)
 
     public GameRoom(String roomId) {
         this.roomId = roomId;

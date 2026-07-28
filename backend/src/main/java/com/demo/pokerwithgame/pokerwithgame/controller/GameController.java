@@ -5,6 +5,7 @@ import com.demo.pokerwithgame.pokerwithgame.model.GameRoom;
 import com.demo.pokerwithgame.pokerwithgame.model.HandEvaluator;
 import com.demo.pokerwithgame.pokerwithgame.model.Player;
 import com.demo.pokerwithgame.pokerwithgame.service.RoomManager;
+import lombok.AllArgsConstructor;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.event.EventListener;
 import org.springframework.messaging.handler.annotation.DestinationVariable;
@@ -14,14 +15,28 @@ import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
 import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.socket.messaging.SessionDisconnectEvent;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 @Controller
 @RequiredArgsConstructor
 public class GameController {
+
+    // 방 목록 API를 위한 DTO (Data Transfer Object)
+    @AllArgsConstructor
+    public static class RoomInfo {
+        public String roomId;
+        public int playerCount;
+        public int spectatorCount;
+        public String gamePhase;
+    }
+
 
     private final RoomManager roomManager;
     private final SimpMessagingTemplate messagingTemplate;
@@ -244,8 +259,49 @@ public class GameController {
         messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
     }
 
+    // 블라인드 베팅 적용 및 턴 설정
+    private void applyBlindsAndSetTurn(GameRoom room) {
+        List<Player> activePlayers = room.getPlayers().values().stream()
+                .filter(p -> !p.isFolded() && p.getChips() > 0)
+                .sorted(Comparator.comparing(Player::getPlayerName))
+                .toList();
+
+        if (activePlayers.size() < 2) return; // 2명 미만이면 블라인드 없음
+
+        // 딜러 버튼 위치 순환
+        room.setDealerPosition((room.getDealerPosition() + 1) % activePlayers.size());
+        int dealerIndex = room.getDealerPosition();
+
+        // 스몰블라인드, 빅블라인드 플레이어 결정
+        int sbIndex = (activePlayers.size() == 2) ? dealerIndex : (dealerIndex + 1) % activePlayers.size();
+        int bbIndex = (activePlayers.size() == 2) ? (dealerIndex + 1) % activePlayers.size() : (dealerIndex + 2) % activePlayers.size();
+
+        Player sbPlayer = activePlayers.get(sbIndex);
+        Player bbPlayer = activePlayers.get(bbIndex);
+
+        int smallBlindAmount = 800;
+        int bigBlindAmount = 1000;
+
+        // 블라인드 강제 베팅 (올인 상황 고려)
+        int sbBet = Math.min(smallBlindAmount, sbPlayer.getChips());
+        sbPlayer.setChips(sbPlayer.getChips() - sbBet);
+        sbPlayer.setCurrentBet(sbBet);
+
+        int bbBet = Math.min(bigBlindAmount, bbPlayer.getChips());
+        bbPlayer.setChips(bbPlayer.getChips() - bbBet);
+        bbPlayer.setCurrentBet(bbBet);
+
+        room.setPot(sbBet + bbBet);
+        room.setHighestBet(Math.max(sbBet, bbBet));
+
+        // 첫 베팅 순서는 빅블라인드 다음 사람
+        int firstTurnIndex = (bbIndex + 1) % activePlayers.size();
+        room.setCurrentTurn(activePlayers.get(firstTurnIndex).getPlayerName());
+    }
+
     // 2. processBet 바로 아래에 페이즈 전환 메서드를 추가하세요.
     private void nextPhase(GameRoom room) {
+        // 다음 베팅 라운드를 위해 플레이어들의 베팅금과 액션 상태 초기화
         room.getPlayers().values().forEach(p -> {
             p.setCurrentBet(0);
             p.setHasActed(false);
@@ -321,20 +377,27 @@ public class GameController {
     }
 
     private void evaluateDiceAndSendResult(String roomId, GameRoom room) {
-        int diceNumber = new Random().nextInt(6) + 1;
-        String actualResult = (diceNumber % 2 == 0) ? "EVEN" : "ODD";
+        int baseDiceNumber = room.getBaseDiceNumber();
 
         Map<String, Object> resultData = new HashMap<>();
-        resultData.put("diceNumber", diceNumber);
+        resultData.put("baseDiceNumber", baseDiceNumber);
 
         // 모든 플레이어를 순회하며 개별 판정
         for (Player p : room.getPlayers().values()) {
-            String guess = room.getDiceGuesses().get(p.getPlayerName());
-            boolean isCorrect = actualResult.equals(guess);
+            String guess = room.getDiceGuesses().get(p.getPlayerName()); // "HIGHER" or "LOWER"
+            int playerDiceNumber = new Random().nextInt(6) + 1;
+
+            boolean isWin = false;
+            if ("HIGHER".equals(guess) && playerDiceNumber > baseDiceNumber) {
+                isWin = true;
+            } else if ("LOWER".equals(guess) && playerDiceNumber < baseDiceNumber) {
+                isWin = true;
+            }
 
             Map<String, Object> pResult = new HashMap<>();
-            pResult.put("isCorrect", isCorrect);
-            if (isCorrect) {
+            pResult.put("isWin", isWin);
+            pResult.put("playerDiceNumber", playerDiceNumber); // 플레이어 주사위 결과도 보내줌
+            if (isWin) {
                 pResult.put("cards", room.drawCards(5));
             } else {
                 p.getHoleCards().add(room.drawCards(1).get(0));
@@ -344,6 +407,7 @@ public class GameController {
         }
 
         room.getDiceGuesses().clear();
+        room.setBaseDiceNumber(0); // 다음 게임을 위해 초기화
         resultData.put("roomState", room);
 
         GameMessage resultMsg = new GameMessage();
@@ -362,7 +426,9 @@ public class GameController {
         if (allReady) {
             if (nextPhaseType.equals("HOLDEM_START")) {
                 room.setHoldemPhase("PRE_FLOP");
-                room.setCurrentTurn(getNextTurn(room, null)); // 알파벳 순서 기반 첫 턴 지정
+                applyBlindsAndSetTurn(room); // 블라인드 룰 적용 및 첫 턴 설정
+            } else if (nextPhaseType.equals("MINIGAME_2_START")) {
+                room.setBaseDiceNumber(new Random().nextInt(6) + 1); // 기준 주사위 설정
             }
             
             GameMessage nextPhaseMsg = new GameMessage();
@@ -418,7 +484,9 @@ public class GameController {
         room.getCurrentFiveCards().clear();
         room.getRpsChoices().clear();
         room.getDiceGuesses().clear();
+        room.setBaseDiceNumber(0);
         room.setWinnerMessage(null); // 방 상태 초기화 부분에 추가
+        room.setDealerPosition(-1); // 딜러 버튼 위치 초기화
 
         // 플레이어 상태 초기화 (칩은 유지)
         for (Player p : room.getPlayers().values()) {
@@ -427,6 +495,18 @@ public class GameController {
             p.setFolded(false);
             p.setHasActed(false);
             p.setReady(false); // 다시 Ready를 눌러야 미니게임 시작
+        }
+
+        // 칩이 0이 된 플레이어를 관전자로 이동
+        List<Player> bankruptPlayers = new ArrayList<>();
+        for (Player p : room.getPlayers().values()) {
+            if (p.getChips() <= 0) {
+                bankruptPlayers.add(p);
+            }
+        }
+        for (Player bankruptPlayer : bankruptPlayers) {
+            room.getPlayers().remove(bankruptPlayer.getPlayerName());
+            room.getSpectators().put(bankruptPlayer.getPlayerName(), bankruptPlayer);
         }
 
         GameMessage updateMsg = new GameMessage();
@@ -461,5 +541,27 @@ public class GameController {
         response.setType("STATE_UPDATE");
         response.setData(room);
         messagingTemplate.convertAndSend("/topic/room/" + roomId, response);
+    }
+
+    // --- 방 목록 조회를 위한 REST API ---
+    @CrossOrigin(origins = "*") // 모든 도메인에서의 요청을 허용 (개발용)
+    @GetMapping("/api/rooms")
+    @ResponseBody
+    public List<RoomInfo> getRoomList() {
+        return roomManager.getAllRooms().values().stream()
+                .map(room -> new RoomInfo(
+                        room.getRoomId(),
+                        room.getPlayers().size(),
+                        room.getSpectators().size(),
+                        getPhaseTextForApi(room.getHoldemPhase())
+                ))
+                .collect(Collectors.toList());
+    }
+
+    private String getPhaseTextForApi(String holdemPhase) {
+        if (holdemPhase == null || "LOBBY".equals(holdemPhase) || "END".equals(holdemPhase)) {
+            return "대기중";
+        }
+        return "게임중";
     }
 }

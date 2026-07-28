@@ -229,6 +229,9 @@ const joinRoom = () => {
       <h3>방에 참여하거나 새로 생성하세요</h3>
       <div class="form-row">
         <label>방 이름:</label>
+        <input v-model="roomId" placeholder="예: room123" style="padding: 5px;" />
+      </div>
+      <div class="form-row">
         <label>내 이름:</label>
         <input v-model="playerName" placeholder="닉네임 입력" style="padding: 5px;" @keyup.enter="joinRoom" />
       </div>

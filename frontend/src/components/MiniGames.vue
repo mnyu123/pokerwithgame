@@ -23,7 +23,7 @@ import PlayingCard from './PlayingCard.vue'
       <h2 v-else>플레이어들이 카드를 고르고 있습니다...</h2>
       
       <div v-if="!isSpectator && isWinner" class="card-selection-area">
-        <div v-for="card in fiveCards" :key="card" @click="selectCard(card)" style="cursor: pointer; transition: transform 0.2s;" onmouseover="this.style.transform='translateY(-10px)'" onmouseout="this.style.transform='translateY(0)'">
+        <div v-for="card in fiveCards.filter(c => !!c)" :key="card" @click="selectCard(card)" style="cursor: pointer; transition: transform 0.2s;" onmouseover="this.style.transform='translateY(-10px)'" onmouseout="this.style.transform='translateY(0)'">
           <PlayingCard :card="card" />
         </div>
       </div>

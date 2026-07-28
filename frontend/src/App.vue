@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, onBeforeUnmount, computed, ref } from 'vue'
+import { onMounted, onBeforeUnmount, computed, ref, watch } from 'vue'
 import { Client } from '@stomp/stompjs'
 
 // 스토어에서 상태와 함수 가져오기
@@ -30,6 +30,30 @@ const phaseText = computed(() => {
 // 방 목록 상태
 const roomList = ref([])
 let roomListInterval = null
+
+// 알림 팝업 상태
+const notification = ref({
+  show: false,
+  title: '',
+  message: '',
+});
+let notificationTimer = null;
+
+function showNotification(title, message, duration = 3500) {
+  if (notificationTimer) {
+    clearTimeout(notificationTimer);
+  }
+  notification.value = { show: true, title, message };
+  notificationTimer = setTimeout(() => {
+    notification.value.show = false;
+    notificationTimer = null;
+  }, duration);
+}
+
+function closeNotification() {
+  notification.value.show = false;
+  if (notificationTimer) clearTimeout(notificationTimer);
+}
 
 onMounted(() => {
   stompClient.value = new Client({
@@ -83,7 +107,7 @@ const quickJoin = (id) => {
 
 // 방 입장 및 라우팅(구독) 로직은 메인 컴포넌트에 유지
 const joinRoom = () => {
-  if (!playerName.value.trim() || !roomId.value.trim()) return alert('방 이름과 이름을 모두 입력해주세요!')
+  if (!playerName.value.trim() || !roomId.value.trim()) return showNotification('입력 오류', '방 이름과 플레이어 이름을 모두 입력해주세요.');
   
   // 🌟 .value를 붙여서 참조 값을 수정합니다.
   if (currentSubscription.value) currentSubscription.value.unsubscribe()
@@ -101,16 +125,18 @@ const joinRoom = () => {
           fiveCards.value = []
       }
     } else if (payload.type === 'MINIGAME_1_START') {
-      if (!isSpectator.value) alert('1차 미니게임: 가위바위보 시작!')
+      if (!isSpectator.value) showNotification('미니게임 시작', '1차 미니게임: 가위바위보!');
       gamePhase.value = 'MINIGAME_1'
     } else if (payload.type === 'MINIGAME_1_DRAW') {
-      if (!isSpectator.value) alert('가위바위보 무승부! 다시 선택해주세요.')
+      if (!isSpectator.value) showNotification('무승부', '가위바위보를 다시 선택해주세요.');
     } else if (payload.type === 'MINIGAME_1_RESULT') {
       const resultData = payload.data
       roomState.value = resultData.roomState 
       
       if (!isSpectator.value) {
-        myHoleCards.value = roomState.value.players[playerName.value].holeCards
+        const playerState = roomState.value.players?.[playerName.value];
+        if (playerState?.holeCards) myHoleCards.value = playerState.holeCards;
+
         const serverChoice = resultData.serverChoice
         const myResult = resultData[playerName.value]
         
@@ -118,20 +144,21 @@ const joinRoom = () => {
         
         if (myResult.isWin) {
           isWinner.value = true
-          fiveCards.value = myResult.cards
-          alert(`서버의 선택: ${rpsMap[serverChoice]}\n가위바위보 승리! 5장 중 한 장을 선택하세요.`)
+          fiveCards.value = myResult.cards || []
+          showNotification('승리!', `서버: ${rpsMap[serverChoice]}<br>가위바위보에서 이겼습니다! 5장의 카드 중 하나를 고르세요.`, 5000)
         } else {
           isWinner.value = false
           fiveCards.value = []
-          alert(`서버의 선택: ${rpsMap[serverChoice]}\n가위바위보 패배/무승부! 서버가 랜덤 카드를 부여합니다.`)
+          showNotification('패배/무승부', `서버: ${rpsMap[serverChoice]}<br>서버가 랜덤으로 카드를 지급합니다.`)
         }
       }
       gamePhase.value = 'CARD_SELECT'
     } else if (payload.type === 'MINIGAME_2_START') {
       roomState.value = payload.data
       if (!isSpectator.value) {
-        myHoleCards.value = roomState.value.players[playerName.value].holeCards
-        alert(`첫 번째 카드 획득!\n이제 2차 미니게임(주사위 High & Low)을 시작합니다!\n기준 숫자는 [${roomState.value.baseDiceNumber}] 입니다.`)
+        const playerState = roomState.value.players?.[playerName.value];
+        if (playerState?.holeCards) myHoleCards.value = playerState.holeCards;
+        showNotification('1차 카드 획득', `2차 미니게임(주사위 High & Low)을 시작합니다.<br>기준 숫자는 [<b>${roomState.value.baseDiceNumber}</b>] 입니다.`);
       }
       gamePhase.value = 'MINIGAME_2'
     } else if (payload.type === 'MINIGAME_2_RESULT') {
@@ -139,26 +166,29 @@ const joinRoom = () => {
       roomState.value = resultData.roomState 
       
       if (!isSpectator.value) {
-        myHoleCards.value = roomState.value.players[playerName.value].holeCards
+        const playerState = roomState.value.players?.[playerName.value];
+        if (playerState?.holeCards) myHoleCards.value = playerState.holeCards;
+
         const myResult = resultData[playerName.value]
-        const alertMsg = `기준 숫자: ${resultData.baseDiceNumber}\n나의 주사위: ${myResult.playerDiceNumber}\n\n`;
+        const alertMsg = `기준 숫자: ${resultData.baseDiceNumber}<br>나의 주사위: ${myResult.playerDiceNumber}<br><br>`;
         
         if (myResult.isWin) {
           isWinner.value = true
-          fiveCards.value = myResult.cards
-          alert(alertMsg + `예측 성공! 두 번째 카드를 선택하세요.`)
+          fiveCards.value = myResult.cards || []
+          showNotification('예측 성공!', alertMsg + `두 번째 카드를 선택하세요.`, 5000)
         } else {
           isWinner.value = false
           fiveCards.value = []
-          alert(alertMsg + `예측 실패! 랜덤으로 카드가 지급되었습니다.`)
+          showNotification('예측 실패', alertMsg + `랜덤으로 카드가 지급되었습니다.`)
         }
       }
       gamePhase.value = 'CARD_SELECT'
     } else if (payload.type === 'HOLDEM_START') {
       roomState.value = payload.data
       if (!isSpectator.value) {
-        myHoleCards.value = roomState.value.players[playerName.value].holeCards
-        alert('두 번째 카드 획득 완료!\n본격적인 텍사스 홀덤을 시작합니다!')
+        const playerState = roomState.value.players?.[playerName.value];
+        if (playerState?.holeCards) myHoleCards.value = playerState.holeCards;
+        showNotification('홀덤 시작', '두 번째 카드를 획득했습니다!<br>이제 텍사스 홀덤을 시작합니다!');
       }
       gamePhase.value = 'HOLDEM_MAIN'
     }
@@ -183,7 +213,7 @@ const joinRoom = () => {
     <div v-if="!isSpectator && myHoleCards.length > 0" style="background-color: #f0f8ff; padding: 10px; margin-bottom: 10px; border-radius: 5px;">
       <strong>내 핸드(Hole Cards):</strong> 
       <div style="display: flex; gap: 10px; margin-top: 10px;">
-        <PlayingCard v-for="card in myHoleCards" :key="card" :card="card" />
+        <PlayingCard v-for="card in myHoleCards.filter(c => !!c)" :key="card" :card="card" />
       </div>
     </div>
     <hr />
@@ -247,6 +277,20 @@ const joinRoom = () => {
     
     <HoldemTable v-if="gamePhase === 'HOLDEM_MAIN'" />
     
+    <!-- 알림 팝업 -->
+    <div v-if="notification.show" class="notification-overlay" @click.self="closeNotification">
+      <div class="notification-popup">
+        <div class="notification-header">
+          <h3>{{ notification.title }}</h3>
+          <button @click="closeNotification" class="close-btn">&times;</button>
+        </div>
+        <div class="notification-body">
+          <!-- v-html을 사용하여 <br> 태그가 렌더링되도록 합니다. -->
+          <p v-html="notification.message"></p>
+        </div>
+      </div>
+    </div>
+
   </div>
 </template>
 
@@ -332,5 +376,61 @@ th {
     width: 100%;
     box-sizing: border-box; /* padding 포함해서 width 100% */
   }
+}
+
+/* 알림 팝업 스타일 */
+.notification-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.6);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.notification-popup {
+  background-color: white;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+  width: 90%;
+  max-width: 400px;
+  text-align: left;
+  border: 1px solid #ddd;
+}
+
+.notification-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 10px;
+  margin-bottom: 15px;
+}
+
+.notification-header h3 {
+  margin: 0;
+  font-size: 1.2em;
+  color: #333;
+}
+
+.notification-body p {
+  margin: 0;
+  line-height: 1.6;
+  color: #555;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  font-size: 1.8rem;
+  cursor: pointer;
+  color: #aaa;
+  line-height: 1;
+  padding: 0 5px;
 }
 </style>
